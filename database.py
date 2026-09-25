@@ -67,6 +67,31 @@ def migrate_input_schema(connection):
         cursor.close()
 
 
+def migrate_block_schema(connection):
+    """Add nullable metadata without rewriting historical allocations. Run before DML."""
+    cursor = connection.cursor(buffered=True)
+    try:
+        for column, definition in (("block_number", "INT NULL"), ("seat_numbers", "TEXT NULL")):
+            cursor.execute(f"SHOW COLUMNS FROM seating_arrangements LIKE '{column}'")
+            if cursor.fetchone() is None:
+                cursor.execute(f"ALTER TABLE seating_arrangements ADD COLUMN {column} {definition}")
+        connection.commit()
+    finally:
+        cursor.close()
+
+
+def migrate_student_semester_schema(connection):
+    """Preserve legacy batches while distinguishing new class/semester/subject data."""
+    cursor = connection.cursor(buffered=True)
+    try:
+        cursor.execute("SHOW COLUMNS FROM student_batches LIKE 'semester'")
+        if cursor.fetchone() is None:
+            cursor.execute("ALTER TABLE student_batches ADD COLUMN semester VARCHAR(50) NULL")
+        connection.commit()
+    finally:
+        cursor.close()
+
+
 def initialize_database():
     """Create the database and tables from schema.sql without deleting data."""
     schema = (BASE_DIR / "schema.sql").read_text(encoding="utf-8")
@@ -86,6 +111,8 @@ def initialize_database():
             cursor.close()
         migrate_seating_schema(connection)
         migrate_input_schema(connection)
+        migrate_block_schema(connection)
+        migrate_student_semester_schema(connection)
     finally:
         connection.close()
 

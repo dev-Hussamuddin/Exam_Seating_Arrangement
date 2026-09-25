@@ -1,4 +1,221 @@
-[Uploading README.md…]()
+# Finalized three-file exam seating workflow
+
+The default workflow uses exactly these three active input workbooks alongside
+the preserved legacy `input/Tables.xlsx`:
+
+| Workbook | Purpose | Columns |
+|---|---|---|
+| `input/Students & Subject Data.xlsx` | Static student/subject groups | Department, Class, Semester, Subject, Roll Nos. (Range / List), Excluded Roll Nos. |
+| `input/Classroom Data.xlsx` | Static room capacities | Room No., Capacity (No. of Benches/Seats) |
+| `input/Timetable.xlsx` | Dynamic exam-day selection | Class, Semester, Subject |
+
+Enter **Exam Date, Exam Name, Month / Year, and Timing** once at the top of
+`Timetable.xlsx`. The program matches Class + Semester + Subject to the static
+student data. Use the same class names in both files; different departments with
+similarly named classes need distinct class names, as illustrated in the examples.
+Numeric roll ranges/lists and mixed lists are supported (`001-010, 015, 020-025`).
+Excluded rolls are removed before counting or allocating. Blank or dash-only
+exclusion cells mean no exclusions. Leading-zero presentation is retained in the
+college report. Overlapping students across different static subjects are allowed;
+the same class/roll appearing twice in the selected daily exams is rejected.
+
+The supplied student and timetable rows are **examples for review**, not actual
+college records. Room capacities are retained from the original workbook:
+201=48, 202=40, 203=45, 204=55, 205=70. The example timetable selects four subjects
+(Business Law and Mathematics remain unscheduled), yielding 225 eligible students,
+258 available seats, 33 unused seats and 8 supervision blocks.
+
+## Run the finalized workflow
+
+With Python dependencies installed, an initialized MySQL database, and
+`MYSQL_PASSWORD` set in the session, run from the project directory:
+
+```powershell
+python -B seating_allocator.py
+```
+
+This validates and imports the three files, allocates only their selected exams
+and listed classrooms, then automatically exports `output/Seating_Arrangement.xlsx`.
+`python -B main.py` remains available as an import-only command. An alternative
+three-file directory can be supplied with `--input-dir "path/to/folder"` to the
+allocator. A partial set of finalized files produces an error instead of silently
+falling back to old data. `--exam-date`, if supplied, must match `Timetable.xlsx`.
+
+Only selected timetable IDs have their allocations replaced. Historical and
+unselected database records are retained and are not included in the new report.
+The importer and allocation stages each retain their transaction/rollback safety.
+The new nullable student-batch `semester` column is added before data transactions;
+legacy batches are not assigned guessed semesters. Exam header metadata is read
+from the current timetable workbook. Live MySQL is not used by the offline tests.
+
+## Finalized output and supervision blocks
+
+The main **Seating Arrangement** sheet matches the college layout, with the college
+heading, exam name, month/year, actual date/weekday and timing above exactly seven
+columns: **Room No., Block No., Class, Semester, Subject, Roll Nos., Grand Total**.
+Room and block labels are merged across their detail rows. Mixed subjects remain
+separate rows within the same supervision block. Grand Total contains each row's
+student count, with the overall total at the bottom. Supporting Room Blocks,
+Allocation Summary and per-room seat maps retain capacity, unused-seat and block
+totals. All sheets have print settings and repeated headings.
+
+Allocation finishes each Class + Semester + Subject group in ascending roll order before moving to the next group. Existing class-ID/timetable-ID priority and room-ID order are preserved. Blocks follow actual occupied seat
+order within each room. 30 is a target, not a maximum: round occupied seats / 30
+to the nearest integer (halves up), at least one block per occupied room, then
+absorb the remainder into the final block. Thus **63 in one room = 30 + 33**.
+Block serials continue across all rooms for the report. No teacher fields exist.
+
+## Verification and templates
+
+```powershell
+python -B -m unittest discover -v
+```
+
+The complete offline suite contains **115 tests**, including three-file parsing,
+timetable/semester filtering, exclusions, capacity, mixed blocks, 63 → 30 + 33,
+continuous numbering, transaction rollback and college-report checks. The sample
+output was generated with an in-memory SQLite adapter, without modifying live
+MySQL. `create_input_templates.py --directory "empty/folder"` can create another
+example set; it refuses to overwrite existing finalized input files.
+
+## Legacy compatibility
+
+The earlier single-workbook formats described below are still supported. To use
+the preserved original workbook explicitly:
+
+```powershell
+python -B main.py --input "input/Tables.xlsx"
+python -B seating_allocator.py --legacy --exam-date 2026-10-05
+```
+
+---
+
+# Earlier one-day / block seating workflow (legacy)
+
+The existing importer, transaction handling and legacy workbook format
+remain supported. `input/Tables.xlsx` is unchanged. Nothing needs to be deleted
+from MySQL to use the additions below.
+
+## Run for one day
+
+```powershell
+# Set MYSQL_PASSWORD in this session, then import the existing workbook:
+python -B main.py --input "input/Tables.xlsx"
+# Select one date; allocations for all other dates are preserved:
+python -B seating_allocator.py --legacy --exam-date 2026-10-05
+```
+
+The date argument can be omitted when the database has only one exam date.
+Multiple stored dates require an explicit selection; the CLI never silently
+generates several days. Database initialization remains `python -B database.py`
+on first use. Normal import/allocation automatically applies additive migrations.
+
+## New input format (optional; old input still works)
+
+Create a separate workbook with these three worksheets. Import it explicitly
+with `python -B main.py --input "path/to/OneDay.xlsx"`; this does not replace
+`input/Tables.xlsx`. Keep the existing room capacities: 201=48, 202=40, 203=45,
+204=55, 205=70, unless the actual rooms change.
+
+**Exam Configuration** has setting names in column A and values in column B,
+without a header row:
+
+| A | B |
+|---|---|
+| Exam Date | 2026-10-05 |
+| Exam Time | 12:00-13:00 |
+
+Enter the date only here. Time may be blank; otherwise supply a complete range.
+All student/subject rows in this format sit this one exam slot. No separate
+timetable sheet is needed. An untimed slot cannot be allocated alongside other
+slots on the same day until its time is configured.
+
+**Student Subject Data** has these headers in its first nonblank row:
+
+| Class | Department | Subject | Roll Number Start | Roll Number End | Excluded Roll Numbers |
+|---|---|---|---:|---:|---|
+| Example class | Example department | Subject A | 1 | 40 | 3,8-9 |
+| Example class | Example department | Subject B | 41 | 70 | 45 |
+
+Eligible counts are calculated as the range minus exclusions (37 and 29 in this
+example), stored in MySQL and shown in allocation output. No supplied count is
+needed. Rows with the same class and different subjects are supported. Disjoint
+ranges for the same class/subject are combined into one exact roll list, retaining
+gaps and exclusions. Repeated/overlapping ranges for that class/subject are
+rejected. A class/roll cannot take two subjects in the same slot. Department is
+required here; a previously unknown department can be filled, but a conflicting
+known department is never silently replaced. There is no teacher field.
+
+**Classroom Data** has headers `Room Number` and `Seating Capacity`, followed by
+one row per room. Capacity is the number of individual seats/benches.
+
+Legacy side-by-side college/legacy tables continue to work, including their
+per-row timetable dates and existing supplied student counts. Disjoint college
+rows for the same class/subject now also combine without filling gaps. As before,
+imports update matching records rather than deleting records absent from Excel;
+changing a dated exam can leave the old timetable entry in place. Review schedule
+changes deliberately instead of deleting historical data automatically.
+
+## Blocks and seat maps
+
+- Finish each exam group before moving to the next, using remaining room seats. Room-ID order is unchanged.
+- Seats are numbered from 1 within each room, in the actual sequential allocation order.
+- A block is a room-level supervision division with a **target of 30 students**,
+  not a maximum or a class/subject division. No teacher assignment is stored.
+- For each occupied room, round student count / 30 to the nearest whole number
+  (halves round up), with at least one block. Earlier blocks take 30 students;
+  the last absorbs the remainder: 63 = 30 + 33, 37 = one block of 37,
+  48 = 30 + 18, and 93 = 30 + 30 + 33. Empty rooms get no blocks.
+- Blocks follow the actual sequential seat order, can contain several classes,
+  departments and subjects, and never span rooms. Groups share a block only at a transition between consecutive groups.
+- Block numbers start at 1 for the report and continue across rooms and slots;
+  they do not restart in each room. A new daily report starts again at 1.
+- No room dimensions are supplied, so the map is a numbered bench/seat list,
+  not an invented physical row/column plan.
+- Student identity is class + roll number. Duplicate students and duplicate seats
+  within a slot are rejected. Legacy slots are still grouped by exact date/time;
+  partially overlapping time intervals are not automatically reconciled.
+
+`seating_arrangements` gains nullable `block_number` and `seat_numbers` fields.
+Existing rows are not backfilled with guessed seat numbers. On regeneration,
+only selected slots are replaced within the existing all-or-nothing transaction.
+Each new database row describes a subject's portion of a supervision block;
+mixed subjects share the same `block_number`. Its comma-separated seat numbers
+map positionally to the ascending rolls expanded from `roll_numbers`.
+
+## Excel output
+
+`output/Seating_Arrangement.xlsx` is generated automatically after allocation
+commits. The directory is created if necessary. It contains:
+
+- **Room Blocks** (opens first): date/time at the top, all five summary metrics,
+  and room/block/class/department/subject/roll/count/unused-seat detail. Several
+  subject rows may share a block number; Total Blocks counts supervision blocks,
+  not those detail rows.
+- **Seating Arrangement**: the original summary layout for compatibility.
+- **Seats 001, Seats 002, ...**: one printable numbered seat list per room/slot,
+  including empty seats, room number, date/time, block and student identity.
+
+The workbook uses bold headers, borders, room shading, wrapped text, repeated
+print headings and landscape print settings. Unknown legacy departments are
+shown as "Not specified" in the new staff sheets. Total capacity used means
+occupied seats; totals across slots count exam attendances, not unique people.
+The old report is replaced only after a complete new workbook has been saved.
+An export failure does not undo committed database allocations.
+
+## Tests
+
+```powershell
+python -B -m unittest discover -v
+```
+
+The original four test modules are retained. `test_one_day_seating.py` adds
+one-day parsing, disjoint groups, exclusions, global blocks, seat-order checks,
+selected-day preservation, rollback and report coverage. Tests use temporary
+workbooks, in-memory SQLite and mocks; they do not change live MySQL data.
+
+---
+
 # College Exam Seating Arrangement System
 
 > **Compact Project Documentation** — designed for quick faculty/project evaluation.
@@ -29,7 +246,7 @@ The project takes class/student, classroom-capacity, and timetable information f
 - Excluded/debarred/left roll-number handling
 - Exam-slot-wise allocation
 - Classroom capacity validation
-- Department-aware room mixing
+- Sequential class/semester/subject allocation
 - Post-allocation validation
 - Transaction + rollback protection
 - Automated Excel report generation
@@ -371,8 +588,8 @@ The seating algorithm is implemented in `seating_allocator.py`.
 5. Calculate total available capacity.
 6. Stop if students exceed available capacity.
 7. Process classrooms in deterministic order.
-8. Place students one by one while tracking department counts in the room.
-9. Prefer an available group from a department with fewer students currently seated in that room.
+8. Place each group in ascending roll order, continuing into subsequent rooms as needed.
+9. Start the next group only after finishing the current group, using remaining room capacity.
 10. Preserve ascending roll-number order within an exam group.
 11. Validate the completed allocation.
 12. Save the allocation to MySQL.
@@ -380,18 +597,15 @@ The seating algorithm is implemented in `seating_allocator.py`.
 
 ### Simple example
 
-For two departments:
+For 99 CS students followed by 19 BA students, with room 201 capacity 60:
 
-```text
-CS       → 1,2,3,4
-Science  → 1,2,3,4
-```
+- Room 201: CS rolls 1-60, blocks 1 and 2 with 30 students each.
+- Room 202: CS rolls 61-99, followed by BA rolls 1-19 (58 students).
+- Room 202 blocks 3 and 4 contain 30 CS, then 9 CS + 19 BA.
 
-the room-selection rule can alternate groups based on the department-count balance, while roll numbers remain in ascending order.
-
-### Why this approach is used
-
-It provides deterministic allocation, respects room capacity, preserves roll ordering, and attempts to mix departments within rooms instead of unnecessarily grouping one department together.
+Blocks remain room-level supervision groups. The target is 30, not a maximum:
+63 students in one room still form blocks of 30 and 33. Block numbering remains
+global and continuous. No teacher fields are added.
 
 ---
 

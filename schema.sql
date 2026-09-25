@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS student_batches (
     non_included_rolls VARCHAR(255),
     subject VARCHAR(150),
     roll_numbers TEXT,
+    semester VARCHAR(50),
     FOREIGN KEY (class_id) REFERENCES classes(class_id)
 ) ENGINE=InnoDB;
 
@@ -49,6 +50,8 @@ CREATE TABLE IF NOT EXISTS seating_arrangements (
     roll_end INT NOT NULL,
     allocated_count INT NOT NULL,
     roll_numbers VARCHAR(500) NOT NULL,
+    block_number INT NULL,
+    seat_numbers TEXT NULL,
     FOREIGN KEY (timetable_id) REFERENCES timetable(timetable_id),
     FOREIGN KEY (classroom_id) REFERENCES classrooms(classroom_id)
 ) ENGINE=InnoDB;

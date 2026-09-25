@@ -34,7 +34,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(write_seating_report(summaries, self.path), self.path)
         book = load_workbook(self.path)
         self.addCleanup(book.close)
-        return book.active
+        return book["Seating Arrangement"]
 
     def test_groups_exclusions_unused_rooms_and_summary(self):
         summaries = sample()
@@ -103,7 +103,7 @@ class ReportTests(unittest.TestCase):
 class ReportIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.connection = Mock()
-        for name in ("migrate_input_schema", "migrate_seating_schema", "print_summary"):
+        for name in ("migrate_input_schema", "migrate_seating_schema", "migrate_block_schema", "print_summary"):
             patcher = patch.object(seating_allocator, name)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -117,7 +117,7 @@ class ReportIntegrationTests(unittest.TestCase):
     def test_report_runs_after_successful_allocation(self):
         summaries = sample()
         events = []
-        def allocate(connection):
+        def allocate(connection, **kwargs):
             events.append("allocation committed")
             return summaries
         def report(data):
@@ -126,7 +126,7 @@ class ReportIntegrationTests(unittest.TestCase):
             return Path("output/Seating_Arrangement.xlsx")
         with patch.object(seating_allocator, "generate_arrangements", side_effect=allocate), \
              patch.object(seating_allocator, "write_seating_report", side_effect=report):
-            self.assertEqual(seating_allocator.main(), 0)
+            self.assertEqual(seating_allocator.main(legacy=True), 0)
         self.assertEqual(events, ["allocation committed", "report"])
         self.connection.close.assert_called_once()
 
@@ -139,13 +139,13 @@ class ReportIntegrationTests(unittest.TestCase):
                     allocate.side_effect = outcome
                 else:
                     allocate.return_value = outcome
-                self.assertEqual(seating_allocator.main(), 1 if isinstance(outcome, Exception) else 0)
+                self.assertEqual(seating_allocator.main(legacy=True), 1 if isinstance(outcome, Exception) else 0)
                 report.assert_not_called()
 
     def test_export_failure_reports_committed_allocation_without_rollback(self):
         with patch.object(seating_allocator, "generate_arrangements", return_value=sample()), \
              patch.object(seating_allocator, "write_seating_report", side_effect=PermissionError("file is open")):
-            self.assertEqual(seating_allocator.main(), 1)
+            self.assertEqual(seating_allocator.main(legacy=True), 1)
         self.connection.rollback.assert_not_called()
         self.connection.close.assert_called_once()
         self.assertTrue(any("Allocation succeeded and was committed" in str(c) for c in self.print.call_args_list))

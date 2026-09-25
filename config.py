@@ -8,6 +8,8 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 ACADEMIC_YEAR = "2026-2027"
+COLLEGE_NAME = "Royal College of Arts, Science & Commerce"
+COLLEGE_SUBTITLE = "(Autonomous)"
 
 MYSQL_CONFIG = {
     "host": os.getenv("MYSQL_HOST", "localhost"),

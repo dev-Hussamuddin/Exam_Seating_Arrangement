@@ -236,11 +236,43 @@ def locate_tables(workbook):
     return tables
 
 
+def merge_subject_groups(records):
+    """Combine disjoint ranges for one class/subject without inventing gap rolls."""
+    result, groups = [], {}
+    for number, record in records["Class Data"]:
+        if len(record) != 8:
+            result.append((number, record))
+            continue
+        cls, dept, low, high, count, excluded, subject, explicit = record
+        key = (cls.casefold(), subject.casefold())
+        if key not in groups:
+            groups[key] = len(result)
+            result.append((number, record))
+            continue
+        index = groups[key]
+        old_number, old = result[index]
+        rolls = set(map(int, explicit.split(",")))
+        previous = set(map(int, old[7].split(",")))
+        if rolls & previous:
+            raise ValueError(f"Class Data, row {number}: duplicate/overlapping class/subject roll ranges.")
+        rolls.update(previous)
+        omitted = set((excluded or "").split(",")) | set((old[5] or "").split(","))
+        omitted.discard("")
+        combined = text(",".join(map(str, sorted(map(int, omitted)))), "Excluded rolls", 255, required=False)
+        result[index] = (old_number, (cls, dept, min(rolls), max(rolls), old[4] + count,
+                                     combined, subject, ",".join(map(str, sorted(rolls)))))
+    records["Class Data"] = result
+    return records
+
+
 def read_workbook(path):
     """Validate all rows before opening a database connection."""
     records = {name: [] for name in HEADERS}
     workbook = load_workbook(path, read_only=False, data_only=False)
     try:
+        if "Exam Configuration" in workbook.sheetnames:
+            from one_day_input import read_one_day_workbook
+            return read_one_day_workbook(workbook)
         tables = locate_tables(workbook)
         for name in HEADERS:
             rows, header_row, indexes, layout = tables[name]
@@ -270,7 +302,7 @@ def read_workbook(path):
                             count = integer(values[4], "No. of Students")
                             record = (cls, None, rolls[0], rolls[-1], count, excluded,
                                       subject, ",".join(map(str, rolls)))
-                            key = (cls.casefold(), subject.casefold())
+                            key = (cls.casefold(), subject.casefold(), tuple(rolls))
                         elif name == "Classroom Data":
                             room = text(values[0], "Room No.", 20)
                             record = (room, integer(values[1], "Capacity", minimum=1))
@@ -324,7 +356,7 @@ def read_workbook(path):
                     raise ValueError(f"{name}, row {row_number}: {error}") from None
     finally:
         workbook.close()
-    return records
+    return merge_subject_groups(records)
 
 
 def import_workbook(path):
@@ -333,24 +365,34 @@ def import_workbook(path):
     Intended for a single local importer at a time. Existing schema is unchanged.
     Student counts are stored as supplied, without subtracting excluded rolls.
     """
+    return import_records(read_workbook(path))
+
+
+def import_records(records, semester_aware=False):
+    """Import validated records with the existing all-or-nothing DML transaction."""
     year = text(ACADEMIC_YEAR, "ACADEMIC_YEAR in config.py", 20)
-    records = read_workbook(path)
     counts = dict(classes=0, batches=0, classrooms=0, timetable=0)
     notices = set()
     connection = get_connection()
     cursor = None
     try:
         migrate_input_schema(connection)
+        if semester_aware:
+            from database import migrate_student_semester_schema
+            migrate_student_semester_schema(connection)
         connection.start_transaction()
         cursor = connection.cursor(buffered=True)
         for row_number, record in records["Class Data"]:
             cls, dept, start, end, count, excluded = record[:6]
-            subject, roll_numbers = record[6:] if len(record) == 8 else (None, None)
+            subject, roll_numbers = record[6:8] if len(record) >= 8 else (None, None)
+            semester = record[8] if len(record) == 9 else None
             cursor.execute("SELECT class_id, department FROM classes WHERE class_name = %s", (cls,))
             existing = cursor.fetchone()
             if existing:
                 class_id, existing_dept = existing
-                if dept is not None and existing_dept.casefold() != dept.casefold():
+                if dept is not None and not existing_dept.strip():
+                    cursor.execute("UPDATE classes SET department=%s WHERE class_id=%s", (dept, class_id))
+                elif dept is not None and existing_dept.casefold() != dept.casefold():
                     raise ValueError(f"Class Data, row {row_number}: {cls} already belongs to {existing_dept}.")
             else:
                 # Empty department means unknown; do not infer it from a class name.
@@ -358,8 +400,13 @@ def import_workbook(path):
                 class_id = cursor.lastrowid
                 counts["classes"] += 1
 
-            cursor.execute("""SELECT batch_id FROM student_batches WHERE class_id = %s AND academic_year = %s
-                AND COALESCE(subject, '')=COALESCE(%s, '')""", (class_id, year, subject))
+            query = """SELECT batch_id FROM student_batches WHERE class_id = %s AND academic_year = %s
+                AND COALESCE(subject, '')=COALESCE(%s, '')"""
+            params = (class_id, year, subject)
+            if semester_aware:
+                query += " AND COALESCE(semester, '')=COALESCE(%s, '')"
+                params += (semester,)
+            cursor.execute(query, params)
             batches = cursor.fetchall()
             if len(batches) > 1:
                 raise ValueError(f"Multiple existing batches for {cls} in {year}; resolve them before importing.")
@@ -368,7 +415,13 @@ def import_workbook(path):
                     number_of_students=%s, non_included_rolls=%s, roll_numbers=%s WHERE batch_id=%s""",
                                (start, end, count, excluded, roll_numbers, batches[0][0]))
             else:
-                cursor.execute("""INSERT INTO student_batches
+                if semester_aware:
+                    cursor.execute("""INSERT INTO student_batches
+                        (class_id, academic_year, roll_start, roll_end, number_of_students, non_included_rolls, subject, roll_numbers, semester)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                                   (class_id, year, start, end, count, excluded, subject, roll_numbers, semester))
+                else:
+                    cursor.execute("""INSERT INTO student_batches
                     (class_id, academic_year, roll_start, roll_end, number_of_students, non_included_rolls, subject, roll_numbers)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""", (class_id, year, start, end, count, excluded, subject, roll_numbers))
             counts["batches"] += 1
@@ -398,10 +451,12 @@ def import_workbook(path):
             if not cursor.fetchone():
                 notices.add(f"{cls} / {subject}: no student data for {year}; timetable preserved, skipped for seating.")
             values = (existing[0], subject, semester, day, start, end, raw)
-            cursor.execute("""SELECT timetable_id FROM timetable WHERE class_id=%s AND subject=%s
+            query = """SELECT timetable_id FROM timetable WHERE class_id=%s AND subject=%s
                 AND COALESCE(semester, '')=COALESCE(%s, '') AND COALESCE(exam_date, '')=COALESCE(%s, '')
-                AND COALESCE(start_time, '')=COALESCE(%s, '') AND COALESCE(end_time, '')=COALESCE(%s, '')
-                AND COALESCE(time_text, '')=COALESCE(%s, '')""", values)
+                AND COALESCE(start_time, '')=COALESCE(%s, '') AND COALESCE(end_time, '')=COALESCE(%s, '')"""
+            if not semester_aware:
+                query += " AND COALESCE(time_text, '')=COALESCE(%s, '')"
+            cursor.execute(query, values[:6] if semester_aware else values)
             if not cursor.fetchone():
                 # Match undated records by the actual exam and parsed time slot.
                 # Source time formatting may differ without changing the exam.
@@ -435,11 +490,22 @@ def import_workbook(path):
     return counts
 
 
-def import_from_input():
+def import_from_input(path=None):
     """Select exactly one workbook, ignoring Excel's temporary lock files."""
-    INPUT_DIR.mkdir(exist_ok=True)
-    files = sorted(p for p in INPUT_DIR.iterdir()
-                   if p.is_file() and p.suffix.lower() == ".xlsx" and not p.name.startswith("~$"))
+    if path is None:
+        from three_file_input import three_file_input_available, read_three_file_input
+        if three_file_input_available(INPUT_DIR):
+            data = read_three_file_input(INPUT_DIR)
+            counts = import_records(data["records"], semester_aware=True)
+            print(f"Imported the three finalized workbooks for {data['exam_info']['exam_date']}.")
+            print(counts)
+            return counts
+        INPUT_DIR.mkdir(exist_ok=True)
+        files = sorted(p for p in INPUT_DIR.iterdir()
+                       if p.is_file() and p.suffix.lower() == ".xlsx" and not p.name.startswith("~$"))
+    else:
+        from pathlib import Path
+        files = [Path(path)]
     if not files:
         print(f"No .xlsx workbook found. Place one Excel workbook in: {INPUT_DIR}")
         return

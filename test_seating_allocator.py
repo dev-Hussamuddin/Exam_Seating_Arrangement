@@ -31,12 +31,12 @@ class AllocationTests(unittest.TestCase):
         result = allocate_slot([exam(1, "CS", 8, "3")], rooms(4, 4))
         self.assertEqual([a["rolls"] for a in result], [[1, 2, 4, 5], [6, 7, 8]])
 
-    def test_different_departments_preferred(self):
+    def test_group_finishes_before_next_department(self):
         exams = [exam(1, "CS"), exam(2, "CS"), exam(3, "BAF")]
         result = allocate_slot(exams, rooms(6, 12))
         first_room = [a for a in result if a["classroom_id"] == 1]
-        self.assertEqual([a["class_id"] for a in first_room], [1, 3])
-        self.assertEqual([len(a["rolls"]) for a in first_room], [3, 3])
+        self.assertEqual([a["class_id"] for a in first_room], [1])
+        self.assertEqual([len(a["rolls"]) for a in first_room], [6])
 
     def test_same_department_fallback(self):
         result = allocate_slot([exam(1, "CS", 2), exam(2, "CS", 2)], rooms(4))
@@ -85,7 +85,8 @@ class PersistenceTests(unittest.TestCase):
         db.executescript("""
             CREATE TABLE seating_arrangements (arrangement_id INTEGER PRIMARY KEY,
                 timetable_id INTEGER, classroom_id INTEGER, roll_start INTEGER,
-                roll_end INTEGER, roll_numbers VARCHAR(500) NOT NULL, allocated_count INTEGER);
+                roll_end INTEGER, roll_numbers VARCHAR(500) NOT NULL, allocated_count INTEGER,
+                block_number INTEGER, seat_numbers TEXT);
             INSERT INTO classes VALUES (1, 'FYCS', 'CS');
             INSERT INTO classrooms VALUES (1, '308', 4);
             INSERT INTO timetable VALUES (1, 1, 'Maths', '1', '2026-10-09', '09:00:00', '10:00:00', NULL);

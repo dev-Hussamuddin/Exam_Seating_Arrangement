@@ -8,10 +8,10 @@ from openpyxl.utils.exceptions import InvalidFileException
 from excel_importer import import_from_input
 
 
-def main():
+def main(input_path=None):
     """Import the input workbook into the existing MySQL database."""
     try:
-        import_from_input()
+        import_from_input(input_path)
         return 0
     except MySQLError as error:
         print(f"Import failed (MySQL error {error.errno}). Check the connection, credentials and database schema.")
@@ -21,4 +21,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", help="Optional workbook path; defaults to input/ discovery.")
+    raise SystemExit(main(parser.parse_args().input))

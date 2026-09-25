@@ -6,8 +6,9 @@ from itertools import groupby
 
 from mysql.connector import Error as MySQLError
 
-from config import ACADEMIC_YEAR
-from database import get_connection, migrate_seating_schema, migrate_input_schema
+from config import ACADEMIC_YEAR, INPUT_DIR
+from database import get_connection, migrate_seating_schema, migrate_input_schema, migrate_block_schema
+from seating_blocks import make_blocks
 from seating_report import write_seating_report
 
 
@@ -68,6 +69,7 @@ def validate_allocation(exams, rooms, allocations):
     expected = {e["timetable_id"]: e for e in exams}
     capacities = {r["classroom_id"]: r["capacity"] for r in rooms}
     actual = defaultdict(list)
+    seats = defaultdict(list)
     used = Counter()
     for allocation in allocations:
         key, room = allocation["timetable_id"], allocation["classroom_id"]
@@ -76,6 +78,10 @@ def validate_allocation(exams, rooms, allocations):
         if allocation["class_id"] != expected[key]["class_id"]:
             raise ValueError("Allocation references the wrong exam.")
         actual[key].extend(allocation["rolls"])
+        assigned = allocation.get("seats", [])
+        if len(assigned) != len(allocation["rolls"]):
+            raise ValueError("Every allocated roll must have exactly one seat.")
+        seats[room].extend(assigned)
         used[room] += len(allocation["rolls"])
     for key, exam in expected.items():
         # Exact list equality verifies coverage, exclusions, duplicates and order.
@@ -83,15 +89,18 @@ def validate_allocation(exams, rooms, allocations):
             raise ValueError(f"Allocation validation failed for {exam['class_name']}.")
     if any(used[room] > capacity for room, capacity in capacities.items()):
         raise ValueError("Room capacity exceeded.")
+    for room, assigned in seats.items():
+        if sorted(assigned) != list(range(1, used[room] + 1)):
+            raise ValueError("Duplicate, missing or invalid seat numbers in a room.")
     if sum(used.values()) != sum(len(e["rolls"]) for e in exams):
         raise ValueError("Allocated count does not equal eligible count.")
 
 
 def allocate_slot(exams, rooms):
-    """Round-robin departments, finishing each class in ascending roll order.
+    """Finish each exam group sequentially before starting the next.
 
-    Rooms use classroom_id order. Prefer a department with fewer seats in the
-    current room, so another department is selected whenever one is available.
+    Preserve caller exam and room order. A group continues into the next room
+    when needed; only its final room may share remaining seats with later groups.
     """
     validate_exam_groups(exams)
     if len({r["classroom_id"] for r in rooms}) != len(rooms):
@@ -106,19 +115,18 @@ def allocate_slot(exams, rooms):
     positions = {e["timetable_id"]: 0 for e in exams}
     result = []
     for room in rooms:
-        departments = Counter()
         seated = {}
-        for _ in range(room["capacity"]):
+        for seat_number in range(1, room["capacity"] + 1):
             available = [e for e in exams if positions[e["timetable_id"]] < len(e["rolls"])]
             if not available:
                 break
-            exam = min(available, key=lambda e: (departments[e["department"].strip().casefold()], e["class_id"], e["timetable_id"]))
+            exam = available[0]
             key = exam["timetable_id"]
             seated.setdefault(key, {"class_id": exam["class_id"], "timetable_id": key,
-                                    "classroom_id": room["classroom_id"], "rolls": []})
+                                    "classroom_id": room["classroom_id"], "rolls": [], "seats": []})
             seated[key]["rolls"].append(exam["rolls"][positions[key]])
+            seated[key]["seats"].append(seat_number)
             positions[key] += 1
-            departments[exam["department"].strip().casefold()] += 1
         result.extend(seated.values())
     validate_allocation(exams, rooms, result)
     return result
@@ -127,8 +135,9 @@ def allocate_slot(exams, rooms):
 def load_slot(cursor, slot):
     cursor.execute("""SELECT t.timetable_id, c.class_id, c.class_name, c.department, t.subject
         FROM timetable t JOIN classes c ON c.class_id=t.class_id
-        WHERE t.exam_date=%s AND t.start_time=%s AND t.end_time=%s
-        ORDER BY c.class_id, t.timetable_id""", slot)
+        WHERE t.exam_date=%s AND (t.start_time=%s OR (t.start_time IS NULL AND %s IS NULL))
+        AND (t.end_time=%s OR (t.end_time IS NULL AND %s IS NULL))
+        ORDER BY c.class_id, t.timetable_id""", (slot[0], slot[1], slot[1], slot[2], slot[2]))
     exams = []
     for timetable_id, class_id, name, department, subject in cursor.fetchall():
         cursor.execute("""SELECT roll_start, roll_end, non_included_rolls, roll_numbers FROM student_batches
@@ -155,19 +164,34 @@ def load_slot(cursor, slot):
     return exams
 
 
-def save_slot(cursor, slot, allocations):
-    cursor.execute("""DELETE FROM seating_arrangements WHERE timetable_id IN
-        (SELECT timetable_id FROM timetable WHERE exam_date=%s AND start_time=%s AND end_time=%s)""", slot)
-    for allocation in allocations:
-        for rolls in storage_chunks(allocation["rolls"]):
-            cursor.execute("""INSERT INTO seating_arrangements
-                (timetable_id, classroom_id, roll_start, roll_end, roll_numbers, allocated_count)
-                VALUES (%s, %s, %s, %s, %s, %s)""",
-                           (allocation["timetable_id"], allocation["classroom_id"], rolls[0], rolls[-1],
-                            compact_ranges(rolls), len(rolls)))
+def save_slot(cursor, slot, allocations, first_block=1, timetable_ids=None):
+    if timetable_ids is not None:
+        for timetable_id in timetable_ids:
+            cursor.execute("DELETE FROM seating_arrangements WHERE timetable_id=%s", (timetable_id,))
+    else:
+        cursor.execute("""DELETE FROM seating_arrangements WHERE timetable_id IN
+        (SELECT timetable_id FROM timetable WHERE exam_date=%s
+        AND (start_time=%s OR (start_time IS NULL AND %s IS NULL))
+        AND (end_time=%s OR (end_time IS NULL AND %s IS NULL)))""",
+                   (slot[0], slot[1], slot[1], slot[2], slot[2]))
+    blocks = make_blocks(allocations, first_block)
+    for block in blocks:
+        # Keep each exam's foreign key; mixed groups share the supervision serial.
+        for group in block["groups"]:
+            offset = 0
+            for rolls in storage_chunks(group["rolls"]):
+                seats = group["seats"][offset:offset + len(rolls)]
+                offset += len(rolls)
+                cursor.execute("""INSERT INTO seating_arrangements
+                    (timetable_id, classroom_id, roll_start, roll_end, roll_numbers, allocated_count,
+                     block_number, seat_numbers) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                               (group["timetable_id"], block["classroom_id"], rolls[0], rolls[-1],
+                                compact_ranges(rolls), len(rolls), block["block_number"],
+                                ",".join(map(str, seats))))
+    return first_block + len(blocks)
 
 
-def generate_arrangements(connection):
+def generate_arrangements(connection, exam_day=None, one_day=False):
     """Replace slots atomically for the whole run. Caller owns the connection."""
     cursor = None
     summaries = []
@@ -176,15 +200,26 @@ def generate_arrangements(connection):
         cursor = connection.cursor(buffered=True)
         cursor.execute("SELECT classroom_id, classroom_no, capacity FROM classrooms ORDER BY classroom_id")
         rooms = [dict(classroom_id=i, classroom_no=n, capacity=c) for i, n, c in cursor.fetchall()]
-        cursor.execute("SELECT DISTINCT exam_date, start_time, end_time FROM timetable ORDER BY exam_date, start_time, end_time")
+        query = "SELECT DISTINCT exam_date, start_time, end_time FROM timetable"
+        if exam_day is not None:
+            from excel_importer import exam_date
+            exam_day = exam_date(exam_day)
+            cursor.execute(query + " WHERE exam_date=%s ORDER BY start_time, end_time", (exam_day,))
+        else:
+            cursor.execute(query + " ORDER BY exam_date, start_time, end_time")
         slots = cursor.fetchall()
-        if any(any(value is None for value in slot) for slot in slots):
+        if one_day and len({slot[0] for slot in slots}) > 1:
+            raise ValueError("Multiple exam dates exist. Select one with --exam-date YYYY-MM-DD; historical data is preserved.")
+        if any(day is None or ((start is None) != (end is None)) for day, start, end in slots):
             raise ValueError("Timetable has undated or incomplete exam slots. Input was preserved; "
                              "set actual exam dates and full time intervals before allocation.")
+        if any(start is None for _, start, _ in slots) and len(slots) > 1 and one_day:
+            raise ValueError("An untimed exam cannot share a day with other slots. Configure its full time interval.")
+        next_block = 1
         for slot in slots:
             exams = load_slot(cursor, slot)
             allocations = allocate_slot(exams, rooms)
-            save_slot(cursor, slot, allocations)
+            next_block = save_slot(cursor, slot, allocations, next_block)
             summaries.append((slot, exams, rooms, allocations))
         connection.commit()
     except Exception:
@@ -197,6 +232,8 @@ def generate_arrangements(connection):
 
 
 def display_time(value):
+    if value is None:
+        return "Not configured"
     if isinstance(value, timedelta):
         seconds = int(value.total_seconds())
         return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}"
@@ -224,22 +261,38 @@ def print_summary(slot, exams, rooms, allocations):
             print(f"{names[row['timetable_id']]}: {compact_ranges(row['rolls'])}")
 
 
-def main():
+def main(exam_day=None, legacy=False, input_dir=None):
     connection = None
     try:
+        data = None
+        if not legacy:
+            from three_file_input import three_file_input_available, read_three_file_input
+            from excel_importer import import_records, exam_date
+            directory = INPUT_DIR if input_dir is None else input_dir
+            if three_file_input_available(directory):
+                data = read_three_file_input(directory)
+                if exam_day is not None and exam_date(exam_day) != data["exam_info"]["exam_date"]:
+                    raise ValueError("--exam-date must match the date in Timetable.xlsx.")
+                import_records(data["records"], semester_aware=True)
         connection = get_connection()
         migrate_seating_schema(connection)
         migrate_input_schema(connection)
+        migrate_block_schema(connection)
         # Finish any metadata transaction before starting the allocation transaction.
         connection.commit()
-        summaries = generate_arrangements(connection)
+        if data is not None:
+            from three_file_workflow import generate_three_file_arrangements
+            summaries = generate_three_file_arrangements(connection, data)
+        else:
+            summaries = generate_arrangements(connection, exam_day=exam_day, one_day=True)
         if not summaries:
             print("No timetable records found. Import the Excel workbook first.")
         for summary in summaries:
             print_summary(*summary)
         if summaries:
             try:
-                report = write_seating_report(summaries)
+                report = (write_seating_report(summaries, exam_info=data["exam_info"])
+                          if data is not None else write_seating_report(summaries))
             except (OSError, ValueError, RuntimeError) as error:
                 print(f"Allocation succeeded and was committed, but Excel report generation failed: {error}")
                 return 1
@@ -247,7 +300,7 @@ def main():
         return 0
     except MySQLError as error:
         print(f"Allocation failed (MySQL error {error.errno}). Check credentials and database setup.")
-    except (ValueError, RuntimeError) as error:
+    except (ValueError, RuntimeError, OSError) as error:
         print(str(error))
     finally:
         if connection is not None:
@@ -256,4 +309,10 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate seating for one exam day without changing other dates.")
+    parser.add_argument("--exam-date", help="YYYY-MM-DD; optional when the database contains only one exam date.")
+    parser.add_argument("--legacy", action="store_true", help="Allocate from existing MySQL timetable instead of the three finalized workbooks.")
+    parser.add_argument("--input-dir", help="Directory containing the three finalized workbooks; defaults to input/.")
+    args = parser.parse_args()
+    raise SystemExit(main(args.exam_date, legacy=args.legacy, input_dir=args.input_dir))

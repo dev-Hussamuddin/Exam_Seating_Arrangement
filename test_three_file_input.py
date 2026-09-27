@@ -52,6 +52,115 @@ class ThreeFileTests(unittest.TestCase):
             counts = importer.import_records(data["records"], semester_aware=True)
         return data, counts
 
+    def test_grouped_fields_inherit_across_blank_rows_and_update_independently(self):
+        def change(sheet):
+            sheet.append([None] * 6)
+            sheet.append([None, None, None, "Another subject", "060-062", None])
+            sheet.append(["New department", "New class", "III", "First", "1-3", "2"])
+            sheet.append(["  ", None, None, "Second", "8,10", None])
+            sheet.append([None, None, "V", "Third", "11-12", None])
+        self.edit(0, change)
+        data, _ = self.import_data()
+        rows = [row for _, row in data["records"]["Class Data"]][-4:]
+        self.assertEqual([(r[0], r[1], r[8]) for r in rows],
+                         [("F.Y.B.A", "Arts", "I"), ("New class", "New department", "III"),
+                          ("New class", "New department", "III"), ("New class", "New department", "V")])
+        self.assertEqual([r[7] for r in rows], ["60,61,62", "1,2,3", "8,10", "11,12"])
+        self.assertEqual([r[4] for r in rows], [3, 2, 2, 2])
+
+    def test_actual_merged_grouped_fields_are_inherited(self):
+        def change(sheet):
+            for column in "ABC":
+                sheet.merge_cells(f"{column}5:{column}6")
+        self.edit(0, change)
+        data, _ = self.import_data()
+        first, second = [row for _, row in data["records"]["Class Data"]][:2]
+        self.assertEqual((first[0], first[1], first[8]), (second[0], second[1], second[8]))
+        self.assertEqual(second[6], "Business Law")
+        self.assertEqual(second[4], 80)  # Exclusions from the first row do not carry.
+
+    def test_first_subject_requires_each_grouped_field(self):
+        for column, label in zip("ABC", ("Department", "Class", "Semester")):
+            with self.subTest(label=label):
+                book = load_workbook(self.directory / FILENAMES[0])
+                old = book.active[f"{column}5"].value
+                book.close()
+                self.edit(0, lambda s: setattr(s[f"{column}5"], "value", None))
+                with self.assertRaisesRegex(ValueError, f"row 5: {label} is blank and no preceding value"):
+                    read_three_file_input(self.directory)
+                self.edit(0, lambda s: setattr(s[f"{column}5"], "value", old))
+
+    def test_subject_does_not_inherit(self):
+        for column, message in (("D", "Subject is required"),):
+            with self.subTest(column=column):
+                book = load_workbook(self.directory / FILENAMES[0])
+                old = book.active[f"{column}6"].value
+                book.close()
+                self.edit(0, lambda s: setattr(s[f"{column}6"], "value", None))
+                with self.assertRaisesRegex(ValueError, message):
+                    read_three_file_input(self.directory)
+                self.edit(0, lambda s: setattr(s[f"{column}6"], "value", old))
+
+    def test_merged_rolls_and_exclusions_inherit(self):
+        def change(s):
+            for column in "ABCEF":
+                s.merge_cells(f"{column}5:{column}6")
+        self.edit(0, change)
+        data, _ = self.import_data()
+        rows = [r for _, r in data["records"]["Class Data"]][:2]
+        self.assertEqual([r[4] for r in rows], [78, 78])
+        self.assertEqual(rows[0][5], rows[1][5])
+
+    def test_grouped_rolls_exclusions_reset_and_blank_exclusions(self):
+        def change(s):
+            s.append([None, None, None, "Second", None, None])
+            s.append([None, None, None, "Third", "60-65", "61"])
+            s.append([None, None, None, "Fourth", None, None])
+            s.append([None, None, None, "Fifth", None, "-"])
+            s.append([None, None, None, "Sixth", "70-72", None])
+        self.edit(0, change)
+        data, _ = self.import_data()
+        rows = [r for _, r in data["records"]["Class Data"]][-5:]
+        self.assertEqual([r[4] for r in rows], [50, 5, 5, 6, 3])
+        self.assertEqual(rows[1][7], rows[2][7])
+
+    def test_rolls_never_inherit_from_another_class_or_semester(self):
+        for cls, semester in (("New class", "I"), ("F.Y.B.A", "III")):
+            with self.subTest(cls=cls, semester=semester):
+                self.edit(0, lambda s: s.append(["Arts", cls, semester, "New", None, None]))
+                with self.assertRaisesRegex(ValueError, "Roll nos. is required"):
+                    read_three_file_input(self.directory)
+                self.edit(0, lambda s: s.delete_rows(s.max_row))
+
+    def test_merged_exclusions_apply_to_explicit_subject_rolls(self):
+        def change(s):
+            s.merge_cells("F5:F6")
+            s["E6"] = "010-025"
+        self.edit(0, change)
+        data = read_three_file_input(self.directory)
+        self.assertEqual(data["records"]["Class Data"][1][1][4], 14)
+
+    def test_no_exclusion_markers_and_numeric_ranges(self):
+        cases = ((None, 80), ("", 80), ("NA", 80), ("N/A", 80),
+                 (" na ", 80), (" n/a ", 80), (1, 79), ("1-5", 75),
+                 ("1,3,5", 77), ("1-5,8,10-12", 71))
+        for value, count in cases:
+            with self.subTest(value=value):
+                self.edit(0, lambda s: setattr(s["F5"], "value", value))
+                data = read_three_file_input(self.directory)
+                self.assertEqual(data["records"]["Class Data"][0][1][4], count)
+
+    def test_na_clears_inherited_exclusions_for_grouped_rolls(self):
+        def change(s):
+            s["E6"] = None
+            s["F6"] = "N/A"
+            s.insert_rows(7)
+            for column, value in enumerate((None, None, None, "Another subject", None, None), 1):
+                s.cell(7, column, value)
+        self.edit(0, change)
+        data, _ = self.import_data()
+        self.assertEqual([r[4] for _, r in data["records"]["Class Data"]][:3], [78, 80, 80])
+
     def test_exact_files_columns_example_counts_and_formatting(self):
         self.assertEqual({p.name for p in self.directory.iterdir()}, set(FILENAMES))
         for filename, header, row in zip(FILENAMES, (STUDENT_HEADERS, ROOM_HEADERS, TIMETABLE_HEADERS), (4, 4, 6)):

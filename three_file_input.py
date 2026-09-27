@@ -39,10 +39,10 @@ def _read_table(path, headers):
                 if all(h in labels for h in expected):
                     if any(labels.count(h) != 1 for h in expected):
                         raise ValueError(f"{path.name}: duplicate table header.")
-                    candidates.append((rows, index, [labels.index(h) for h in expected]))
+                    candidates.append((rows, index, [labels.index(h) for h in expected], sheet))
         if len(candidates) != 1:
             raise ValueError(f"{path.name}: exactly one table with headers {', '.join(headers)} is required.")
-        rows, header, columns = candidates[0]
+        rows, header, columns, sheet = candidates[0]
         for number, row in enumerate(rows, 1):
             if any(isinstance(v, str) and v.startswith("=") for v in row):
                 raise ValueError(f"{path.name}, row {number}: use values, not formulas.")
@@ -50,6 +50,14 @@ def _read_table(path, headers):
         for number, row in enumerate(rows[header + 1:], header + 2):
             values = [row[i] if i < len(row) else None for i in columns]
             if any(v is not None and str(v).strip() for v in values):
+                # An explicit merged exclusion applies even when a subject has
+                # its own roll list. Do not expand merged subjects or blank rows.
+                if headers == STUDENT_HEADERS:
+                    column = columns[5] + 1
+                    for merged in sheet.merged_cells.ranges:
+                        if merged.min_col == merged.max_col == column and merged.min_row <= number <= merged.max_row:
+                            values[5] = sheet.cell(merged.min_row, column).value
+                            break
                 data.append((number, values))
         if not data:
             raise ValueError(f"{path.name}: the table has no data rows.")
@@ -69,18 +77,38 @@ def read_three_file_input(directory):
     records = {"Class Data": [], "Classroom Data": [], "Timetable": []}
     _, students = _read_table(directory / FILENAMES[0], STUDENT_HEADERS)
     groups, departments = {}, {}
+    context = [None, None, None]
+    previous_group = None
+    previous_rolls = previous_excluded = None
     for number, row in students:
         try:
+            # Merged-cell continuations use the same rule as blank grouped fields.
+            for index, label in enumerate(STUDENT_HEADERS[:3]):
+                if row[index] is not None and str(row[index]).strip():
+                    context[index] = row[index]
+                if context[index] is None:
+                    raise ValueError(f"{label} is blank and no preceding value has been established.")
+                row[index] = context[index]
             dept, cls, semester, subject = (text(row[0], "Department", 100), text(row[1], "Class", 50),
                                            text(row[2], "Semester", 50), text(row[3], "Subject", 150))
             class_key = normalized_label(cls)
             if departments.setdefault(class_key, normalized_label(dept)) != normalized_label(dept):
                 raise ValueError("Use distinct class names for classes in different departments.")
+            student_group = tuple(normalized_label(v) for v in (dept, cls, semester))
+            if student_group != previous_group:
+                previous_rolls = previous_excluded = None
+            inherits_rolls = row[4] is None or not str(row[4]).strip()
+            if inherits_rolls:
+                row[4] = previous_rolls
+                if row[5] is None or not str(row[5]).strip():
+                    row[5] = previous_excluded
             rolls = set(parse_roll_list(row[4]))
-            excluded_value = None if str(row[5]).strip() in ("-", "–", "—") else row[5]
+            excluded_value = None if str(row[5]).strip().casefold() in ("-", "–", "—", "na", "n/a") else row[5]
             excluded = set(parse_roll_list(excluded_value, "Excluded Roll Nos.", allow_empty=True))
             if not excluded <= rolls:
                 raise ValueError("Excluded rolls must belong to the supplied roll range/list.")
+            previous_group = student_group
+            previous_rolls, previous_excluded = row[4], excluded_value
             widths = [len(token) for token in re.findall(r"\d+", str(row[4])) if len(token) > 1 and token.startswith("0")]
             width = max(widths, default=0)
             key = _key(cls, semester, subject)
